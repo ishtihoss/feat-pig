@@ -59,6 +59,20 @@ MODEL="${CLAUDE_FEAT_MODEL:-opus}"
 EFFORT="${CLAUDE_FEAT_EFFORT:-xhigh}"
 : > "$LOG"
 
+# Cross-repo support: $CLAUDE_EXTRA_DIRS is a colon-separated list of absolute
+# paths (e.g. sibling repos) the inner sessions need tool access to. Each
+# valid path becomes a --add-dir flag on the per-iteration `claude -p` call.
+# Unset / empty / non-existent paths are silently skipped. macOS-bash-3-safe
+# expansion via ${arr[@]+"${arr[@]}"} below.
+declare -a EXTRA_DIR_FLAGS=()
+if [ -n "${CLAUDE_EXTRA_DIRS:-}" ]; then
+  IFS=':' read -ra _XDIRS <<< "$CLAUDE_EXTRA_DIRS"
+  for d in "${_XDIRS[@]}"; do
+    [ -n "$d" ] && [ -d "$d" ] && EXTRA_DIR_FLAGS+=(--add-dir "$d")
+  done
+  echo "[$(date +%H:%M:%S)] Extra dirs granted to inner sessions: ${#EXTRA_DIR_FLAGS[@]} valid path(s) from CLAUDE_EXTRA_DIRS" >> "$LOG"
+fi
+
 count_unbuilt() { grep -E '^### ' "$FEATURES_FILE" 2>/dev/null | grep -cv 'DONE' | tr -d '\n'; }
 count_total()   { grep -cE '^### ' "$FEATURES_FILE" 2>/dev/null | tr -d '\n'; }
 state_line()    { printf '%s total, %s unbuilt' "$(count_total)" "$(count_unbuilt)"; }
@@ -101,6 +115,7 @@ Rules:
     --effort "$EFFORT" \
     --permission-mode bypassPermissions \
     --max-turns 80 \
+    ${EXTRA_DIR_FLAGS[@]+"${EXTRA_DIR_FLAGS[@]}"} \
     >> "$LOG" 2>&1 || {
       echo "[$(date +%H:%M:%S)] iteration $i FAILED (claude exit $?). Stopping." >> "$LOG"
       break
@@ -131,6 +146,7 @@ echo "[$(date +%H:%M:%S)] Loop done. Final state: $(state_line)" >> "$LOG"
 Before running it, in the same bash invocation:
 - `export ARGUMENTS_PATH="$ARGUMENTS"` — path to the feature file.
 - Optionally `export CLAUDE_FEAT_MODEL=...` and `export CLAUDE_FEAT_EFFORT=...` if the user wants a non-default model/effort for the inner sessions. Defaults are `opus` + `xhigh`. Valid effort levels: `low, medium, high, xhigh, max`.
+- Optionally `export CLAUDE_EXTRA_DIRS="/abs/path1:/abs/path2"` (colon-separated absolute paths) if the inner sessions need tool access to directories outside the cwd. Common case: a sibling repo whose code the feature touches. Each existing path becomes a `--add-dir <path>` flag on the per-iteration `claude -p` call. Non-existent paths are silently skipped.
 
 ## Safety rails
 
