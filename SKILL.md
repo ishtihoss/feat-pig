@@ -73,6 +73,42 @@ if [ -n "${CLAUDE_EXTRA_DIRS:-}" ]; then
   echo "[$(date +%H:%M:%S)] Extra dirs granted to inner sessions: ${#EXTRA_DIR_FLAGS[@]} valid path(s) from CLAUDE_EXTRA_DIRS" >> "$LOG"
 fi
 
+# --- Multi-model review plumbing --------------------------------------------
+# Each inner iteration gets an automatic second opinion from a two-model panel —
+# GLM 5.2 (`consult_glm52`) AND the latest Kimi K2.7 (`consult_kimi27`), both in
+# the `porkicoder-consult` MCP server. Headless `claude -p` does NOT auto-load
+# user-scope MCP servers, so we extract that one server entry from ~/.claude.json
+# and hand it to the inner sessions via `--mcp-config` (one config exposes BOTH
+# tools). If the server isn't configured, MCP_FLAGS stays empty and the inner
+# prompt silently falls back to its own self-review — behaviour unchanged.
+MCP_TMPDIR="$(mktemp -d -t feat-pig-mcp-XXXXXX 2>/dev/null || echo "")"
+MCP_CONFIG="${MCP_TMPDIR:+$MCP_TMPDIR/mcp-consult.json}"
+declare -a MCP_FLAGS=()
+if [ -n "$MCP_CONFIG" ] && [ -f "$HOME/.claude.json" ] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$HOME/.claude.json" "$MCP_CONFIG" <<'PYEOF' || true
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+try:
+    cfg = json.load(open(src))
+    entry = (cfg.get("mcpServers") or {}).get("porkicoder-consult")
+    if entry:
+        # Serialize fully, then write in one call so a mid-write failure can
+        # never leave a partial JSON that --mcp-config would choke on.
+        out = json.dumps({"mcpServers": {"porkicoder-consult": entry}})
+        open(dst, "w").write(out)
+except Exception:
+    pass
+PYEOF
+fi
+if [ -n "$MCP_CONFIG" ] && [ -s "$MCP_CONFIG" ]; then
+  MCP_FLAGS=(--mcp-config "$MCP_CONFIG")
+  echo "[$(date +%H:%M:%S)] Multi-model review ENABLED (GLM 5.2 + Kimi 2.7 via $MCP_CONFIG)" >> "$LOG"
+else
+  echo "[$(date +%H:%M:%S)] Multi-model review DISABLED (porkicoder-consult not in ~/.claude.json) — self-review only" >> "$LOG"
+fi
+# Best-effort cleanup of the temp MCP config when the script exits.
+[ -n "$MCP_TMPDIR" ] && trap 'rm -rf "$MCP_TMPDIR"' EXIT
+
 count_unbuilt() { grep -E '^### ' "$FEATURES_FILE" 2>/dev/null | grep -cv 'DONE' | tr -d '\n'; }
 count_total()   { grep -cE '^### ' "$FEATURES_FILE" 2>/dev/null | tr -d '\n'; }
 state_line()    { printf '%s total, %s unbuilt' "$(count_total)" "$(count_unbuilt)"; }
@@ -107,7 +143,12 @@ Rules:
 2. Read the feature entry in full AND any code it references. Understand the full scope — read neighbouring code, existing patterns, and anything marked as 'done' in earlier entries that this feature may depend on. Do not pattern-match a shallow implementation.
 3. Implement the feature. Create new files when the feature calls for it; edit existing files when the feature extends them. Follow the codebase's existing conventions (naming, module shape, auth patterns, error handling). Do NOT introduce abstractions, refactors, or additional features beyond what the entry specifies.
 4. Scope discipline: if you discover that this feature depends on work that wasn't listed, or you spot a genuine gap/sub-feature while implementing, append it as a new '### N. <title>' entry under the appropriate '## <priority> priority' section of $FEATURES_FILE — do NOT build it this iteration. If the dependency is a hard blocker, append it and stop (still mark nothing DONE); the outer loop will pick it up next iteration.
-5. Self-review pass: re-read your diff. Does it match what the entry described? Does it break any existing feature (especially ones already marked DONE)? If yes, fix in the same iteration.
+5. Self-review pass: re-read your diff. Does it match what the entry described? Does it break any existing feature (especially ones already marked DONE)? If yes, fix in the same iteration. Then get an automatic second opinion from a two-model panel — GLM 5.2 (MCP tool consult_glm52) AND the latest Kimi K2.7 (MCP tool consult_kimi27):
+   - These tools are only present when the MCP server is configured. If neither consult_glm52 nor consult_kimi27 is available, SKIP this entirely and SILENTLY — your own self-review above stands; do not mention it, do not fail.
+   - Neither model has any repo access, so curate ONE context bundle for both: this feature's intent (the entry's title + body), your full \`git diff\` (strip lockfile / build-output / node_modules churn), and the full current contents of the hand-written files you changed (summarize very large or generated files rather than pasting them whole).
+   - Call BOTH consult_glm52 AND consult_kimi27 with a 'question' scoped ONLY to correctness, regressions, and security — explicitly NOT style or nits — passing the SAME bundle as 'context'.
+   - If ONE tool errors, proceed with whatever ran; never let a consult error abort the iteration.
+   - VALIDATE each issue either model raises against the real code before acting on it (a model can be wrong about code it never received). Fix every CONFIRMED real issue IN THIS SAME ITERATION, before marking the feature DONE. Discard unconfirmed or style-only findings.
 6. Update the feature's entry in $FEATURES_FILE: append ' — DONE' to its '### ' heading, and rewrite the body to describe (a) what was built, (b) which files/functions/routes changed or were added, and (c) anything a reviewer should pay attention to. Keep it concise — match the style of existing DONE entries.
 7. Do NOT commit. Do NOT touch any other unbuilt feature. Do NOT run the app or start servers. Type-checking and linting commands are fine.
 8. End with a one-line summary: 'Built: <feature title>'." \
@@ -116,6 +157,7 @@ Rules:
     --permission-mode bypassPermissions \
     --max-turns 80 \
     ${EXTRA_DIR_FLAGS[@]+"${EXTRA_DIR_FLAGS[@]}"} \
+    ${MCP_FLAGS[@]+"${MCP_FLAGS[@]}"} \
     >> "$LOG" 2>&1 || {
       echo "[$(date +%H:%M:%S)] iteration $i FAILED (claude exit $?). Stopping." >> "$LOG"
       break
@@ -156,6 +198,7 @@ Before running it, in the same bash invocation:
 - `--permission-mode bypassPermissions` is required for autonomy. Every inner iteration is sandboxed to one feature and cannot commit.
 - If `claude -p` returns non-zero, the loop stops — the user investigates via the log.
 - The log lives next to the feature file as `.feat-pig.log`. Gitignore it.
+- **Automatic multi-model review (advisory).** When the `porkicoder-consult` MCP server is configured in `~/.claude.json`, each iteration's self-review (rule 5) is augmented with a second opinion from a two-model panel — GLM 5.2 (`consult_glm52`) AND the latest Kimi K2.7 (`consult_kimi27`). The loop extracts that one server from `~/.claude.json` and passes it to the inner sessions via `--mcp-config` (headless `claude -p` does **not** auto-load user-scope MCP servers). The inner session curates a context bundle (feature intent + diff + changed-file contents — the models have no repo access), asks each model only about correctness/regressions/security, VALIDATES every raised issue against the real code, and fixes any confirmed-real issue in the SAME iteration before marking the feature DONE. It is purely advisory: a single tool error is tolerated (proceed with whatever ran), and if the server is absent the step is skipped silently and behaviour is identical to self-review only. The trade-off is added latency and token cost per iteration; the review never aborts the loop.
 
 ## Differences from fix-bugs
 
@@ -165,3 +208,4 @@ Keep these in mind when normalising or triaging:
 - Feature entries often have embedded sub-lists of acceptance criteria or endpoints. Keep those as prose/sub-bullets in the body — they are NOT separate features.
 - **Out-of-scope** items in feature docs are common (explicit non-goals). Never promote them to `### ` headings; keep them under a `## Non-goals` or `## Out of scope` section.
 - Feature bodies can be long (design rationale, API contracts, schema tables). The inner session needs the full body, so never truncate during normalisation.
+- **Multi-model review is shared with fix-bugs.** Both skills now run the same automatic GLM 5.2 + Kimi 2.7 second opinion inside each iteration (here on rule 5's self-review; in fix-bugs on its rule 4 regression check), with the same graceful degradation when `porkicoder-consult` is absent. The only difference is what it scrutinises — a new feature's correctness here vs. a fix's correctness/regression there.
